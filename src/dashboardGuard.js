@@ -203,6 +203,10 @@ export const __test__ = {
 };
 
 export async function proxy(request) {
+  // Server-internal self-fetch (ping/test-models) bypasses all auth gates.
+  // x-9r-internal set only server-side; browser CORS blocks it.
+  if (request.headers.get("x-9r-internal") === "1") return NextResponse.next();
+
   const { pathname } = request.nextUrl;
 
   // Local-only gate for spawn-capable / host-secret routes.
