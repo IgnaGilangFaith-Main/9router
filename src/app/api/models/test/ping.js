@@ -52,7 +52,21 @@ async function getInternalHeaders() {
   return headers;
 }
 
-export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:${process.env.PORT || UPDATER_CONFIG.appPort}`) {
+export function resolveInternalBaseUrl() {
+  // Self-fetch must not go to a fixed localhost port: on Vercel serverless each
+  // function instance listens on its own ephemeral port (20128 doesn't exist),
+  // so 127.0.0.1:20128 → ECONNREFUSED → "fetch failed" on model tests.
+  // Vercel injects VERCEL_URL (e.g. my-app.vercel.app) and serves the same
+  // deployment under the request host, so self-fetch via the public URL works.
+  if (process.env.VERCEL) {
+    return `https://${process.env.VERCEL_URL || process.env.NEXT_PUBLIC_BASE_URL || "localhost"}`;
+  }
+  // Local dev / Docker: request reaches the app on the configured port.
+  const port = process.env.PORT || UPDATER_CONFIG.appPort;
+  return `http://127.0.0.1:${port}`;
+}
+
+export async function pingModelByKind(model, kind, baseUrl = resolveInternalBaseUrl()) {
   const headers = await getInternalHeaders();
   const start = Date.now();
 

@@ -24,7 +24,11 @@ export async function POST(request, { params }) {
 
     let models = getProviderModels(alias);
 
-    const baseUrl = `http://127.0.0.1:${process.env.PORT || UPDATER_CONFIG.appPort}`;
+    // Self-fetch: on Vercel serverless there is no fixed localhost port — each
+    // function instance listens on its own ephemeral port. Reuse the resolver
+    // from ping.js (VERCEL_URL public self-URL vs 127.0.0.1:PORT locally).
+    const { resolveInternalBaseUrl } = await import("@/app/api/models/test/ping");
+    const baseUrl = resolveInternalBaseUrl();
 
     // Compatible providers: fetch live model list
     if (isCompatible && models.length === 0) {
