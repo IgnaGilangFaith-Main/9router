@@ -153,6 +153,9 @@ async function hasValidApiKey(request) {
 }
 
 async function canAccessPublicLlmApi(request) {
+  // Server-internal self-fetch (ping, test-models) — skip auth gate.
+  // Header set only server-side; browser CORS blocks it.
+  if (request.headers.get("x-9r-internal") === "1") return true;
   if (isLocalRequest(request)) return true;
   if (await hasValidCliToken(request)) return true;
   return await hasValidApiKey(request);

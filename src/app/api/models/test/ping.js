@@ -49,6 +49,10 @@ async function getInternalHeaders() {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
   headers["x-9r-cli-token"] = await getConsistentMachineId(CLI_TOKEN_SALT);
+  // Mark self-fetch as server-internal so dashboardGuard skips the public API key gate.
+  // Vercel serverless: each invocation gets a fresh random machineId, so the CLI token
+  // check always fails on self-fetch. Internal marker is safe — browser CORS blocks it.
+  headers["x-9r-internal"] = "1";
   return headers;
 }
 
