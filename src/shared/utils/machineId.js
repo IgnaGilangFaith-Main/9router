@@ -19,10 +19,20 @@ function loadRawMachineId() {
     cachedRawId = fs.readFileSync(MACHINE_ID_FILE, 'utf8').trim();
     if (cachedRawId) return cachedRawId;
   } catch {}
-  try {
-    cachedRawId = machineIdSync();
-  } catch {
+  // machineIdSync() shells out to `hostname` / reads /etc/machine-id — both
+  // unavailable on Vercel serverless, where /tmp is fresh per cold start and the
+  // file-based persistence below only covers the instance lifetime. On Vercel a
+  // random UUID per instance is fine for ephemeral deploys, and it avoids a
+  // noisy "hostname: command not found" from the shell child process. machineIdSync()
+  // is still used on normal hosts where the machine identity is stable.
+  if (process.env.VERCEL) {
     cachedRawId = crypto.randomUUID();
+  } else {
+    try {
+      cachedRawId = machineIdSync();
+    } catch {
+      cachedRawId = crypto.randomUUID();
+    }
   }
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
