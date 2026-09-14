@@ -44,9 +44,10 @@ export async function handleSearch(request) {
     log.debug("AUTH", "No API key provided (local mode)");
   }
 
-  // Enforce API key if enabled in settings
+  // Enforce API key if enabled in settings (skip for server-internal self-fetch)
   const settings = await getSettings();
-  if (settings.requireApiKey) {
+  const isInternal = request.headers.get("x-9r-internal") === "1";
+  if (settings.requireApiKey && !isInternal) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");

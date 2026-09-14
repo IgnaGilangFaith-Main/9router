@@ -37,7 +37,9 @@ export async function handleImageGeneration(request) {
 
   const apiKey = extractApiKey(request);
   const settings = await getSettings();
-  if (settings.requireApiKey) {
+  // Server-internal self-fetch (model ping/test) — skip the API key gate.
+  const isInternal = request.headers.get("x-9r-internal") === "1";
+  if (settings.requireApiKey && !isInternal) {
     if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     const valid = await isValidApiKey(apiKey);
     if (!valid) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");

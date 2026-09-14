@@ -66,9 +66,13 @@ export async function handleChat(request, clientRawRequest = null) {
     log.debug("AUTH", "No API key provided (local mode)");
   }
 
+  // Server-internal self-fetch (model ping/test etc.) — skip the API key gate.
+  // x-9r-internal is set only server-side; browser CORS blocks it.
+  const isInternal = request.headers.get("x-9r-internal") === "1";
+
   // Enforce API key if enabled in settings
   const settings = await getSettings();
-  if (settings.requireApiKey) {
+  if (settings.requireApiKey && !isInternal) {
     if (!apiKey) {
       log.warn("AUTH", "Missing API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");

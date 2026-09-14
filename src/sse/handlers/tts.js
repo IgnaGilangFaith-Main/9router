@@ -34,7 +34,9 @@ export async function handleTts(request) {
   log.request("POST", `${url.pathname} | ${modelStr} | format=${responseFormat}${language ? ` | lang=${language}` : ""}`);
 
   const settings = await getSettings();
-  if (settings.requireApiKey) {
+  // Server-internal self-fetch (model ping/test) — skip the API key gate.
+  const isInternal = request.headers.get("x-9r-internal") === "1";
+  if (settings.requireApiKey && !isInternal) {
     const apiKey = extractApiKey(request);
     if (!apiKey) return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
     const valid = await isValidApiKey(apiKey);
