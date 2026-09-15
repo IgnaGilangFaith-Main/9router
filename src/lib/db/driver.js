@@ -4,6 +4,18 @@ import { ensureDirs, DATA_FILE } from "./paths.js";
 if (!global._dbAdapter) global._dbAdapter = { instance: null, initPromise: null, logged: false };
 const state = global._dbAdapter;
 
+async function tryLibsql() {
+  // Turso / remote libsql — only when DATABASE_URL + DATABASE_TOKEN are set
+  if (!process.env.DATABASE_URL || !process.env.DATABASE_TOKEN) return null;
+  try {
+    const { createLibsqlAdapter } = await import("./adapters/libsqlAdapter.js");
+    return await createLibsqlAdapter();
+  } catch (e) {
+    console.warn(`[DB] libsql unavailable: ${e.message}`);
+    return null;
+  }
+}
+
 async function tryBunSqlite() {
   // Bun runtime only — built-in, no install needed
   if (!process.versions.bun) return null;
@@ -59,9 +71,10 @@ async function trySqlJs() {
 async function initAdapter() {
   ensureDirs();
   // Order per runtime:
-  //   Bun:  bun:sqlite → sql.js
-  //   Node: better-sqlite3 → node:sqlite (≥22.5) → sql.js
-  let adapter = await tryBunSqlite();
+  //   Turso: libsql (remote) → bun:sqlite → sql.js
+  //   Node:  libsql (remote) → better-sqlite3 → node:sqlite (≥22.5) → sql.js
+  let adapter = await tryLibsql();
+  if (!adapter) adapter = await tryBunSqlite();
   if (!adapter) adapter = await tryBetterSqlite();
   if (!adapter) adapter = await tryNodeSqlite();
   if (!adapter) adapter = await trySqlJs();
