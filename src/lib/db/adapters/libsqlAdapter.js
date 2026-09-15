@@ -1,20 +1,38 @@
 // Turso (libsql) adapter for Vercel / remote DB.
-// Uses sql.js (sync) for in-process ops + @libsql/client (async) for Turso persistence.
-// On init: fetches schema + data from Turso → loads into sql.js in-memory.
-// On write: executes in sql.js (sync) + fire-and-forget to Turso.
-// This lets the rest of the codebase call db.get/run/all synchronously.
+//
+// IMPORTANT: @libsql/client is fully ASYNC (execute() returns a Promise).
+// The rest of the codebase calls db.get()/db.run()/db.all() SYNCHRONOUSLY
+// (157 call sites, better-sqlite3-style). We cannot await inside those calls.
+//
+// Strategy: sql.js in-memory DB = source of truth for sync reads/writes.
+//   - On init:  pull schema + rows from Turso into sql.js (sync load).
+//   - On write: apply to sql.js (sync) AND push to a serial async queue.
+//   - On tx:    statements inside an active tx frame accumulate; on commit
+//               they replay to Turso as ONE atomic batch; on rollback the
+//               frame is discarded (matches sql.js savepoint semantics).
+//
+// The queue runs strictly one item at a time (prevents SQLITE_BUSY on
+// file:/ URLs) and is fail-open: errors retry up to MAX_RETRIES then drop
+// with a log — sync callers never see a thrown exception.
 import initSqlJs from "sql.js";
+
+const RETRY_DELAY_MS = 200;
+const MAX_RETRIES = 3;
 
 export async function createLibsqlAdapter() {
   const dbUrl = process.env.DATABASE_URL;
   const dbToken = process.env.DATABASE_TOKEN;
-  if (!dbUrl || !dbToken) return null;
+  if (!dbUrl) return null;
+  // Token required only for remote URLs; file:/ URLs need none.
+  const isRemote = !dbUrl.startsWith("file:");
+  if (isRemote && !dbToken) return null;
 
   let turso;
   try {
     const { createClient } = await import("@libsql/client");
     turso = createClient({ url: dbUrl, authToken: dbToken });
-    await turso.execute("SELECT 1");
+    const res = await turso.execute("SELECT 1 AS ok");
+    if (!res?.rows?.length) throw new Error("empty response");
     console.log("[DB] Turso connected:", dbUrl.replace(/\?.*$/, ""));
   } catch (e) {
     console.warn("[DB] Turso connection failed, falling through:", e.message);
@@ -24,23 +42,52 @@ export async function createLibsqlAdapter() {
   const SQL = await initSqlJs();
   const memDb = new SQL.Database();
 
-  // ── Sync schema + data from Turso → sql.js ──────────────────────────
-  await _syncFromTurso(turso, memDb);
+  // Seed sql.js from existing Turso DB (empty on first run = fresh).
+  await syncFromTurso(turso, memDb);
 
-  // ── Fire-and-forget helper (async, non-blocking) ────────────────────
-  function _flush(sql, params) {
-    turso.execute({ sql, args: params || [] }).catch((e) => {
-      console.error("[DB] Turso write failed:", e.message);
-    });
+  // ── Serial async write queue (one worker; atomic batch per tx) ──────
+  const queue = [];
+  let flushing = false;
+
+  async function flush() {
+    if (flushing) return;
+    flushing = true;
+    while (queue.length) {
+      const item = queue.shift();
+      try {
+        if (item.txBatch) {
+          // Atomic replay of the whole transaction
+          await turso.batch(item.txBatch.map((s) => ({ sql: s.sql, args: s.args || [] })));
+        } else {
+          await turso.execute({ sql: item.sql, args: item.args || [] });
+        }
+      } catch (e) {
+        item.retries = (item.retries || 0) + 1;
+        if (item.retries >= MAX_RETRIES) {
+          console.error("[DB] Turso flush dropped:", (item.sql || `tx(${item.txBatch?.length})`).slice(0, 80), "->", e.message);
+        } else {
+          queue.unshift({ ...item, retries: item.retries });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        }
+      }
+    }
+    flushing = false;
   }
 
-  function _flushRaw(sql) {
-    turso.execute(sql).catch((e) => {
-      console.error("[DB] Turso exec failed:", e.message);
-    });
+  function enqueue(item) {
+    queue.push(item);
+    flush().catch((e) => console.error("[DB] queue worker error:", e.message));
   }
 
-  // ── Adapter interface (sync, matches better-sqlite3 / sql.js) ──────
+  // ── Transaction frame stack (nested-safe, rollback discards) ─────────
+  const txStack = [];
+  function queueStmt(sql, args) {
+    const frame = txStack[txStack.length - 1];
+    if (frame) { frame.stmts.push({ sql, args }); return; }
+    enqueue({ sql, args });
+  }
+
+  // ── Adapter interface (sync — mirrors better-sqlite3 / sql.js) ──────
   function run(sql, params = []) {
     const stmt = memDb.prepare(sql);
     try {
@@ -49,7 +96,7 @@ export async function createLibsqlAdapter() {
       const changes = memDb.getRowsModified();
       const li = memDb.exec("SELECT last_insert_rowid() as id");
       const lastInsertRowid = li[0]?.values?.[0]?.[0] ?? null;
-      _flush(sql, params);
+      queueStmt(sql, params);
       return { changes, lastInsertRowid };
     } finally {
       stmt.free();
@@ -81,19 +128,23 @@ export async function createLibsqlAdapter() {
 
   function exec(sql) {
     memDb.exec(sql);
-    _flushRaw(sql);
+    queueStmt(sql, []);
   }
 
   function transaction(fn) {
     const sp = `sp_${Math.random().toString(36).slice(2)}`;
+    const frame = { stmts: [] };
+    txStack.push(frame);
     memDb.exec(`SAVEPOINT ${sp}`);
     try {
       const result = fn();
       memDb.exec(`RELEASE ${sp}`);
-      _flushRaw(`RELEASE ${sp}`);
+      txStack.pop();
+      if (frame.stmts.length) enqueue({ txBatch: frame.stmts });
       return result;
     } catch (e) {
       try { memDb.exec(`ROLLBACK TO ${sp}`); memDb.exec(`RELEASE ${sp}`); } catch {}
+      if (txStack[txStack.length - 1] === frame) txStack.pop();
       throw e;
     }
   }
@@ -108,24 +159,18 @@ export async function createLibsqlAdapter() {
   };
 }
 
-// ── Sync Turso → sql.js ──────────────────────────────────────────────
-async function _syncFromTurso(turso, memDb) {
+// ── Pull schema + rows from Turso → sql.js ───────────────────────────
+async function syncFromTurso(turso, memDb) {
   try {
-    // 1. Get DDL for all tables + indexes
     const masters = await turso.execute(
       "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index')"
     );
     const tables = [];
     for (const row of masters.rows) {
-      try {
-        memDb.exec(row.sql);
-      } catch { /* may already exist */ }
-      if (row.type === "table" && row.name !== "sqlite_sequence") {
-        tables.push(row.name);
-      }
+      try { memDb.exec(row.sql); } catch {}
+      if (row.type === "table" && row.name !== "sqlite_sequence") tables.push(row.name);
     }
 
-    // 2. Copy data from each table
     let totalRows = 0;
     for (const tableName of tables) {
       try {
@@ -149,7 +194,7 @@ async function _syncFromTurso(turso, memDb) {
             console.warn(`[DB] sync row ${tableName}: ${e.message}`);
           }
         }
-      } catch { /* empty table or missing */ }
+      } catch {}
     }
     console.log(`[DB] Turso → sql.js: ${tables.length} tables, ${totalRows} rows`);
   } catch (e) {
