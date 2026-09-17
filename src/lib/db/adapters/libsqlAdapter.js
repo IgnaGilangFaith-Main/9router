@@ -1,16 +1,5 @@
 // Turso (libsql) adapter for Vercel / remote DB — SYNC NATIVE.
-//
-// Uses `libsql` (better-sqlite3-compatible native binding, sync API) pointed
-// directly at the remote Turso URL. Every db.get()/db.run()/db.all()/
-// db.transaction() call round-trips synchronously to Turso — no in-memory
-// mirror, no async queue, no fire-and-forget. This is the ONLY adapter that
-// truly persists under Vercel serverless (cold starts, frozen lambdas, no
-// background process).
-//
-// API contract: identical to better-sqlite3 (prepare/get/all/run, exec,
-// transaction, close).
 import Database from "libsql";
-
 import { PRAGMA_SQL } from "../schema.js";
 
 export async function createLibsqlAdapter() {
@@ -23,10 +12,9 @@ export async function createLibsqlAdapter() {
     const opts = dbUrl.startsWith("file:") ? {} : { authToken: dbToken };
     const db = new Database(dbUrl, opts);
 
-    // PRAGMA tuning that's safe for remote (no WAL on server side; skip journal_mode)
     try { db.exec("PRAGMA busy_timeout = 8000"); } catch {}
     try { db.exec("PRAGMA foreign_keys = ON"); } catch {}
-    try { db.exec(PRAGMA_SQL); } catch { /* remote may reject some pragmas; ignore */ }
+    try { db.exec(PRAGMA_SQL); } catch {}
 
     console.log("[DB] Turso connected (sync):", dbUrl.replace(/\?.*$/, ""));
     return {
@@ -40,8 +28,35 @@ export async function createLibsqlAdapter() {
       all(sql, params = []) {
         return db.prepare(sql).all(...params);
       },
-      exec(sql) { db.exec(sql); },
-      transaction(fn) { return db.transaction(fn)(); },
+      exec(sql) {
+        db.exec(sql);
+      },
+      executeMultiple(stmts) {
+        // Build one big SQL string, execute in single round-trip to Turso.
+        // stmts: array of { sql, params } or plain strings.
+        const parts = [];
+        for (const s of stmts) {
+          if (typeof s === "string") {
+            parts.push(s.endsWith(";") ? s : s + ";");
+          } else if (s && s.sql) {
+            let sql = s.sql;
+            if (s.params && s.params.length) {
+              let idx = 0;
+              sql = sql.replace(/\?/g, () => {
+                const v = s.params[idx++];
+                if (v === null || v === undefined) return "NULL";
+                if (typeof v === "number") return String(v);
+                return "'" + String(v).replace(/'/g, "''") + "'";
+              });
+            }
+            parts.push(sql.endsWith(";") ? sql : sql + ";");
+          }
+        }
+        db.exec(parts.join("\n"));
+      },
+      transaction(fn) {
+        return db.transaction(fn)();
+      },
       checkpoint() {},
       close() { try { db.close(); } catch {} },
       raw: db,

@@ -93,81 +93,94 @@ export async function exportDb() {
   return out;
 }
 
+function q(sql, args = []) {
+  return { sql, args };
+}
+
 export async function importDb(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Invalid database payload");
   }
   const db = await getAdapter();
 
-  // No wrapping transaction. Each statement runs individually.
-  // Remote Turso over libsql sync: each db.run() inside a transaction frame
-  // holds the connection open across hundreds of HTTP round-trips, exceeding
-  // Vercel's 300s serverless timeout (504). Individual statements complete
-  // fast enough to stay within the lambda budget.
-  // Trade-off: partial import on mid-flight crash (acceptable for backup restore).
+  // Collect all statements into an array for batch execution.
+  // Remote Turso over libsql sync: individual db.run() calls each cost one
+  // HTTP round-trip (~200ms SG->US). Hundreds of rows x 200ms = timeout.
+  // executeMultiple sends everything in a single call.
+  const stmts = [];
 
   // Wipe all tables (keep _meta)
-  db.run(`DELETE FROM settings`);
-  db.run(`DELETE FROM providerConnections`);
-  db.run(`DELETE FROM providerNodes`);
-  db.run(`DELETE FROM proxyPools`);
-  db.run(`DELETE FROM apiKeys`);
-  db.run(`DELETE FROM combos`);
-  db.run(`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`);
+  stmts.push(q(`DELETE FROM settings`));
+  stmts.push(q(`DELETE FROM providerConnections`));
+  stmts.push(q(`DELETE FROM providerNodes`));
+  stmts.push(q(`DELETE FROM proxyPools`));
+  stmts.push(q(`DELETE FROM apiKeys`));
+  stmts.push(q(`DELETE FROM combos`));
+  stmts.push(q(`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`));
 
   // Settings
   if (payload.settings) {
-    db.run(
+    stmts.push(q(
       `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
       [stringifyJson(payload.settings)]
-    );
+    ));
   }
 
   for (const c of payload.providerConnections || []) {
     const { id, provider, authType, name, email, priority, isActive, createdAt, updatedAt, ...rest } = c;
-    db.run(
+    stmts.push(q(
       `INSERT OR REPLACE INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, provider, authType || "oauth", name || null, email || null, priority || null, isActive === false ? 0 : 1, stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
-    );
+    ));
   }
   for (const n of payload.providerNodes || []) {
     const { id, type, name, createdAt, updatedAt, ...rest } = n;
-    db.run(
+    stmts.push(q(
       `INSERT OR REPLACE INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
       [id, type || null, name || null, stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
-    );
+    ));
   }
   for (const p of payload.proxyPools || []) {
     const { id, isActive, testStatus, createdAt, updatedAt, ...rest } = p;
-    db.run(
+    stmts.push(q(
       `INSERT OR REPLACE INTO proxyPools(id, isActive, testStatus, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
       [id, isActive === false ? 0 : 1, testStatus || "unknown", stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
-    );
+    ));
   }
   for (const k of payload.apiKeys || []) {
-    db.run(
+    stmts.push(q(
       `INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
       [k.id, k.key, k.name || null, k.machineId || null, k.isActive === false ? 0 : 1, k.createdAt || new Date().toISOString()]
-    );
+    ));
   }
   for (const c of payload.combos || []) {
-    db.run(
+    stmts.push(q(
       `INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
       [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
-    );
+    ));
   }
   for (const [a, m] of Object.entries(payload.modelAliases || {})) {
-    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('modelAliases', ?, ?)`, [a, stringifyJson(m)]);
+    stmts.push(q(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('modelAliases', ?, ?)`, [a, stringifyJson(m)]));
   }
   for (const m of payload.customModels || []) {
     const k = `${m.providerAlias}|${m.id}|${m.type || "llm"}`;
-    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, stringifyJson(m)]);
+    stmts.push(q(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, stringifyJson(m)]));
   }
   for (const [tool, mappings] of Object.entries(payload.mitmAlias || {})) {
-    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('mitmAlias', ?, ?)`, [tool, stringifyJson(mappings || {})]);
+    stmts.push(q(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('mitmAlias', ?, ?)`, [tool, stringifyJson(mappings || {})]));
   }
   for (const [provider, models] of Object.entries(payload.pricing || {})) {
-    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('pricing', ?, ?)`, [provider, stringifyJson(models || {})]);
+    stmts.push(q(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('pricing', ?, ?)`, [provider, stringifyJson(models || {})]));
+  }
+
+  // Execute all in one batch call to avoid N round-trips
+  if (typeof db.executeMultiple === "function") {
+    db.executeMultiple(stmts);
+  } else {
+    // Fallback: individual statements (still no wrapping transaction)
+    for (const s of stmts) {
+      db.run(s.sql, s.args);
+    }
   }
 
   return await exportDb();
