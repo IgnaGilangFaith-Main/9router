@@ -33,17 +33,18 @@ export async function createLibsqlAdapter() {
       },
       executeMultiple(stmts) {
         // Build one big SQL string, execute in single round-trip to Turso.
-        // stmts: array of { sql, params } or plain strings.
+        // stmts: array of { sql, args/params } or plain strings.
         const parts = [];
         for (const s of stmts) {
           if (typeof s === "string") {
             parts.push(s.endsWith(";") ? s : s + ";");
           } else if (s && s.sql) {
             let sql = s.sql;
-            if (s.params && s.params.length) {
+            const params = s.args || s.params || [];
+            if (params.length) {
               let idx = 0;
               sql = sql.replace(/\?/g, () => {
-                const v = s.params[idx++];
+                const v = params[idx++];
                 if (v === null || v === undefined) return "NULL";
                 if (typeof v === "number") return String(v);
                 return "'" + String(v).replace(/'/g, "''") + "'";
