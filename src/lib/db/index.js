@@ -99,68 +99,76 @@ export async function importDb(payload) {
   }
   const db = await getAdapter();
 
-  db.transaction(() => {
-    // Wipe all tables (keep _meta)
-    db.run(`DELETE FROM settings`);
-    db.run(`DELETE FROM providerConnections`);
-    db.run(`DELETE FROM providerNodes`);
-    db.run(`DELETE FROM proxyPools`);
-    db.run(`DELETE FROM apiKeys`);
-    db.run(`DELETE FROM combos`);
-    db.run(`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`);
+  // No wrapping transaction. Each statement runs individually.
+  // Remote Turso over libsql sync: each db.run() inside a transaction frame
+  // holds the connection open across hundreds of HTTP round-trips, exceeding
+  // Vercel's 300s serverless timeout (504). Individual statements complete
+  // fast enough to stay within the lambda budget.
+  // Trade-off: partial import on mid-flight crash (acceptable for backup restore).
 
-    // Settings
-    if (payload.settings) {
-      db.run(`INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, [stringifyJson(payload.settings)]);
-    }
+  // Wipe all tables (keep _meta)
+  db.run(`DELETE FROM settings`);
+  db.run(`DELETE FROM providerConnections`);
+  db.run(`DELETE FROM providerNodes`);
+  db.run(`DELETE FROM proxyPools`);
+  db.run(`DELETE FROM apiKeys`);
+  db.run(`DELETE FROM combos`);
+  db.run(`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`);
 
-    for (const c of payload.providerConnections || []) {
-      const { id, provider, authType, name, email, priority, isActive, createdAt, updatedAt, ...rest } = c;
-      db.run(
-        `INSERT OR REPLACE INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [id, provider, authType || "oauth", name || null, email || null, priority || null, isActive === false ? 0 : 1, stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
-      );
-    }
-    for (const n of payload.providerNodes || []) {
-      const { id, type, name, createdAt, updatedAt, ...rest } = n;
-      db.run(
-        `INSERT OR REPLACE INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
-        [id, type || null, name || null, stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
-      );
-    }
-    for (const p of payload.proxyPools || []) {
-      const { id, isActive, testStatus, createdAt, updatedAt, ...rest } = p;
-      db.run(
-        `INSERT OR REPLACE INTO proxyPools(id, isActive, testStatus, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
-        [id, isActive === false ? 0 : 1, testStatus || "unknown", stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
-      );
-    }
-    for (const k of payload.apiKeys || []) {
-      db.run(
-        `INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
-        [k.id, k.key, k.name || null, k.machineId || null, k.isActive === false ? 0 : 1, k.createdAt || new Date().toISOString()]
-      );
-    }
-    for (const c of payload.combos || []) {
-      db.run(
-        `INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
-        [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
-      );
-    }
-    for (const [a, m] of Object.entries(payload.modelAliases || {})) {
-      db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('modelAliases', ?, ?)`, [a, stringifyJson(m)]);
-    }
-    for (const m of payload.customModels || []) {
-      const k = `${m.providerAlias}|${m.id}|${m.type || "llm"}`;
-      db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, stringifyJson(m)]);
-    }
-    for (const [tool, mappings] of Object.entries(payload.mitmAlias || {})) {
-      db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('mitmAlias', ?, ?)`, [tool, stringifyJson(mappings || {})]);
-    }
-    for (const [provider, models] of Object.entries(payload.pricing || {})) {
-      db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('pricing', ?, ?)`, [provider, stringifyJson(models || {})]);
-    }
-  });
+  // Settings
+  if (payload.settings) {
+    db.run(
+      `INSERT INTO settings(id, data) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
+      [stringifyJson(payload.settings)]
+    );
+  }
+
+  for (const c of payload.providerConnections || []) {
+    const { id, provider, authType, name, email, priority, isActive, createdAt, updatedAt, ...rest } = c;
+    db.run(
+      `INSERT OR REPLACE INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, provider, authType || "oauth", name || null, email || null, priority || null, isActive === false ? 0 : 1, stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
+    );
+  }
+  for (const n of payload.providerNodes || []) {
+    const { id, type, name, createdAt, updatedAt, ...rest } = n;
+    db.run(
+      `INSERT OR REPLACE INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
+      [id, type || null, name || null, stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
+    );
+  }
+  for (const p of payload.proxyPools || []) {
+    const { id, isActive, testStatus, createdAt, updatedAt, ...rest } = p;
+    db.run(
+      `INSERT OR REPLACE INTO proxyPools(id, isActive, testStatus, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
+      [id, isActive === false ? 0 : 1, testStatus || "unknown", stringifyJson(rest), createdAt || new Date().toISOString(), updatedAt || new Date().toISOString()]
+    );
+  }
+  for (const k of payload.apiKeys || []) {
+    db.run(
+      `INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
+      [k.id, k.key, k.name || null, k.machineId || null, k.isActive === false ? 0 : 1, k.createdAt || new Date().toISOString()]
+    );
+  }
+  for (const c of payload.combos || []) {
+    db.run(
+      `INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)`,
+      [c.id, c.name, c.kind || null, stringifyJson(c.models || []), c.createdAt || new Date().toISOString(), c.updatedAt || new Date().toISOString()]
+    );
+  }
+  for (const [a, m] of Object.entries(payload.modelAliases || {})) {
+    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('modelAliases', ?, ?)`, [a, stringifyJson(m)]);
+  }
+  for (const m of payload.customModels || []) {
+    const k = `${m.providerAlias}|${m.id}|${m.type || "llm"}`;
+    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, stringifyJson(m)]);
+  }
+  for (const [tool, mappings] of Object.entries(payload.mitmAlias || {})) {
+    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('mitmAlias', ?, ?)`, [tool, stringifyJson(mappings || {})]);
+  }
+  for (const [provider, models] of Object.entries(payload.pricing || {})) {
+    db.run(`INSERT OR REPLACE INTO kv(scope, key, value) VALUES('pricing', ?, ?)`, [provider, stringifyJson(models || {})]);
+  }
 
   return await exportDb();
 }
